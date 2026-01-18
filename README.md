@@ -6,7 +6,7 @@ This repository provides a containerized **Samba Active Directory Domain Control
 
 This setup automates the deployment of a Samba-based Domain Controller. It handles the initial provisioning, raises the functional level to **2016**, updates the AD schema to **2019**, configures reverse DNS lookup zones automatically, and allows for the bulk creation of user accounts during the first boot.
 
-NOTE: The AD “functional level” is the same across Windows Server 2016, 2019, 2022, and 2025.
+NOTE: Microsoft has not made changes to the "functional level" since 2016.  Therefore, the AD functional level 2016 is the same across Windows Server 2016, 2019, 2022, and 2025.  In short, this just deploys the latest AD with a 2019 schema (the most up to date schema that Samba recognizes).
 
 ---
 
