@@ -106,8 +106,8 @@ services:
       - SYS_ADMIN
     networks:
       macvlan_net:
-        ipv4_address: 10.10.10.11
-        mac_address: 02:42:0A:0A:0A:0B
+        ipv4_address: 192.168.1.123
+        mac_address: 02:42:C0:A8:01:7B
     environment:
       - TZ=US/Central
       - AD_ADMIN_PASS=P@55w0rd1!
