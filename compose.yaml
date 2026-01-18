@@ -1,0 +1,108 @@
+# NETWORK INFO
+# The 'networks:' section assigns a service to a user created network.
+#
+# In order for this 'docker-compose.yml' file to work, the following Docker network
+# must be created before hand:
+#
+#   Use this for QNAP NAS devices
+#   docker network create -d qnet --ipam-driver=qnet --ipam-opt=iface=eth4 --subnet=10.10.10.0/24 --gateway 10.10.10.1 macvlan_net --opt=iface=eth4
+#     *  Reference: https://qnap-dev.github.io/container-station-api/qnet.html
+#
+#   Use this for standard Docker
+#   docker network create -d macvlan --subnet=10.10.10.0/24 --gateway=10.10.10.1 -o parent=ens33 macvlan_net
+#                            |     |          |           |           |        |           |   | |         |
+#                            +-----+          +-----------+           +--------+           +---+ +----+----+
+#                               |                   |                      |                 |        |
+#   This needs to match the ----+                   |                      |                 |        |
+#   driver used for the                             |                      |                 |        |
+#   network (the default driver                     |                      |                 |        |
+#   for macvlan networks in Docker                  |                      |                 |        |
+#   is 'macvlan', the default                       |                      |                 |        |
+#   for QNAP NAS is 'qnet'.                         |                      |                 |        |
+#                                                   |                      |                 |        |
+#   This needs to match the subnet in  -------------+                      |                 |        |
+#   your environment.                                                      |                 |        |
+#                                                                          |                 |        |
+#   This needs to match the IP of your ------------------------------------+                 |        |
+#   gateway.                                                                                 |        |
+#                                                                                            |        |
+#   This needs to match the name of    ------------------------------------------------------+        |
+#   your interface (NIC).                                                                             |
+#                                                                                                     |
+#   This can be any user assigned ------------------+-------------------------------------------------+
+#   value, but both of these need                   |
+#   to match.                                       |
+#                                                   |
+#      +--------------------------------------------+
+#      |
+# +----+----+
+# |         |
+networks:
+  macvlan_net:
+    external: true
+
+volumes:
+  config:
+  data:
+
+x-all-health: &all-health
+  interval: 10m
+  timeout: 10s
+  retries: 5
+  start_period: 5m
+  start_interval: 10s
+
+services:
+  dc1:
+    build:
+      context: .
+      dockerfile: ./Dockerfiles/Dockerfile_samba-ad-dc
+    container_name: samba-ad-dc
+    hostname: dc1
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      macvlan_net:
+        ipv4_address: 10.10.10.11
+        # Docker generated MAC addresses are "02:42" + the HEX value of
+        # the IP address.  For example:
+        #   * IP Address:        "172.17.0.2"
+        #   * HEX Value:        "ac.11.00.02"
+        #   * Docker MAC: "02:42:ac:11:00:02"
+        mac_address: 02:42:0A:0A:0A:0B
+#    dns:
+#      - 127.0.0.1
+#    domainname: vlab.local
+    environment:
+      - TZ=US/Central
+      - AD_ADMIN_PASS=P@55w0rd1!
+      - AD_FQDN=example.com
+      - DNS_FORWARDER="8.8.8.8"
+      - AD_CREATE_USERS=UberAdmin:P@ssw0rd123:Enterprise Admins;Domain Admins,jsmith:SeekritPass987:Domain Users,ajones:SecurePass99:Domain Users
+    healthcheck:
+      # [SIMPLE]    Test if the LDAP service is listening
+#      test: ["CMD-SHELL", "</dev/tcp/127.0.0.1/389"]
+      # [ADVANCED]  Perform full LDAP query against self
+      #             Catches the "DC is alive, but broken" use case
+      test: ["CMD-SHELL", "samba-tool domain info 127.0.0.1 > /dev/null 2>&1"]
+      <<: *all-health
+    volumes:
+      - config:/etc/samba
+      - data:/var/lib/samba
+#      - ./configFiles/provision.env:/tmp/provision.env:ro
+#    secrets:
+#      - AD_ADMIN_PASS
+#      - AD_FQDN
+#      - DNS_FORWARDER
+#      - AD_CREATE_USERS
+
+#secrets:
+#  AD_ADMIN_PASS:
+#    file: ./private/ad_admin_pass.txt
+#  AD_FQDN:
+#    file: ./private/ad_fqdn.txt
+#  DNS_FORWARDER:
+#    file: ./private/dns_forwarder.txt
+#  AD_CREATE_USERS:
+#    file: ./private/ad_create_users.txt
