@@ -169,7 +169,7 @@ The easiest way to manage the AD/DC deployed from this container, is to join a W
 
 #### Joining to the Domain
 
-To join a Windows client (10, 11, Server 20xx), follow these steps.
+To join a Windows client (10, 11, Server 19xx/20xx), follow these steps.
 
 1. Deploy a Windows client in your lab environment.
 2. Update the DNS settings of the Windows client to the IP of the AD/DC deployed by this container.
