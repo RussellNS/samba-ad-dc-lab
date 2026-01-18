@@ -132,13 +132,6 @@ volumes:
 networks:
   macvlan_net:
     external: true
-volumes:
-  config_vol:
-  data_vol:
-
-networks:
-  macvlan_net:
-    external: true
 ```
 
 ---
