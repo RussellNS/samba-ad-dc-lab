@@ -159,6 +159,7 @@ To ensure your Active Directory database persists across container restarts and 
 The ability to stand up and tear down a clean AD/DC with pre-provisioned users has multiple use cases:
 
 * Application testing that requires authenticating or joining to an AD domain
+* Single Sign-On (SSO) testing that requires AD and SAML configurations
 * Automation testing that reads or modifies AD or LDAP attributes
 * Classroom lab environments
 * Home lab environments
