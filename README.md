@@ -101,21 +101,37 @@ services:
       dockerfile: ./Dockerfiles/Dockerfile_samba-ad-dc
     container_name: samba-ad-dc
     hostname: dc1
+    restart: unless-stopped
     cap_add:
       - SYS_ADMIN
     networks:
       macvlan_net:
-        ipv4_address: 192.168.1.123
+        ipv4_address: 10.10.10.11
+        mac_address: 02:42:0A:0A:0A:0B
     environment:
       - TZ=US/Central
       - AD_ADMIN_PASS=P@55w0rd1!
       - AD_FQDN=example.com
-      - DNS_FORWARDER=8.8.8.8
+      - DNS_FORWARDER="8.8.8.8"
       - AD_CREATE_USERS=testUser1:Pass123:Domain Admins,testUser2:Pass456:Domain Users
+    healthcheck:
+      interval: 10m
+      timeout: 10s
+      retries: 5
+      start_period: 5m
+      start_interval: 10s
+      test: ["CMD-SHELL", "samba-tool domain info 127.0.0.1 > /dev/null 2>&1"]
     volumes:
-      - config_vol:/etc/samba
-      - data_vol:/var/lib/samba
+      - config:/etc/samba
+      - data:/var/lib/samba
 
+volumes:
+  config:
+  data:
+
+networks:
+  macvlan_net:
+    external: true
 volumes:
   config_vol:
   data_vol:
