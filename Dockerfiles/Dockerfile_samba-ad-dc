@@ -1,0 +1,530 @@
+FROM debian:trixie
+
+# -----------------------------------------------------------------------------
+# Build Arguments & Environment Variables
+# -----------------------------------------------------------------------------
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# -----------------------------------------------------------------------------
+# Install Dependencies
+# -----------------------------------------------------------------------------
+# Install Samba and necessary components for a Domain Controller
+# NOTE: The '--no-install-recommends' argument is required to stop the package
+#       'samba-ad-dc' from pulling in 'systemd-resolve', which will kill the
+#       Docker image build.  However, this also stops the 'samba-ad-dc' package
+#       from pulling in other requried packages.  For that reason, the other
+#       packages that 'samba-ad-dc' requires are explicitely added in
+#       addition to some maintenance and convenience packages.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # --- Core Samba AD DC Services ---
+    # The primary domain controller engine and its required Python/VFS modules
+    samba-ad-dc \
+    samba-ad-provision \
+    samba-dsdb-modules \
+    samba-vfs-modules \
+    python3-samba \
+    python3-setproctitle \
+    \
+    # --- Identity & Authentication ---
+    # Kerberos for secure tickets and Winbind for Linux/AD identity mapping
+    krb5-user \
+    krb5-config \
+    libpam-krb5 \
+    winbind \
+    libnss-winbind \
+    libpam-winbind \
+    \
+    # --- Directory & Database Management ---
+    # Tools to manage the LDB/TDB databases and query the LDAP directory
+    ldb-tools \
+    tdb-tools \
+    ldap-utils \
+    \
+    # --- Filesystem Permissions ---
+    # Required for Windows ACL support and extended filesystem attributes
+    acl \
+    attr \
+    \
+    # --- Network Diagnostics & DNS ---
+    # Essential tools for DNS record verification and network troubleshooting
+    dnsutils \
+    bind9-dnsutils \
+    inetutils-ping \
+    net-tools \
+    iproute2 \
+    \
+    # --- System Management & Lifecycle ---
+    # Supervisor for process management and Tini for correct signal handling
+    tini \
+    supervisor \
+    \
+    # --- Administrative Utilities ---
+    # General purpose tools for file sync, testing shares, and text editing
+    smbclient \
+    rsync \
+    tzdata \
+    tzdata-legacy \
+    nano \
+    # Start AD/DC fresh, but keep original 'smb.conf' (enable first time install)
+    && mv /etc/samba/smb.conf /etc/samba/smb.conf.orig \
+    # Clean up apt
+    && apt-get clean autoclean \
+    && apt-get autoremove --yes \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}/ \
+    && rm -fr /tmp/* /var/tmp/*
+
+# -----------------------------------------------------------------------------
+# Configure supervisord
+# -----------------------------------------------------------------------------
+# Create Supervisor configuration to manage the Samba process
+# (This replaces the init script's job of starting services)
+RUN echo "[supervisord]" > /etc/supervisor/conf.d/supervisord.conf && \
+    echo "nodaemon=true" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "[program:samba]" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "command=/usr/sbin/samba -i" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stdout_logfile=/dev/stdout" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stdout_logfile_maxbytes=0" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stderr_logfile=/dev/stderr" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stderr_logfile_maxbytes=0" >> /etc/supervisor/conf.d/supervisord.conf
+
+# -----------------------------------------------------------------------------
+# Configure Samba
+# -----------------------------------------------------------------------------
+# Create permanent directories for Samba state
+RUN mkdir -p /run/samba /var/lib/samba/private /var/lib/samba/bind-dns
+
+# -----------------------------------------------------------------------------
+# Configure OS users
+# -----------------------------------------------------------------------------
+# Configure OS to look at winbind for user/group lookups
+RUN sed -i 's/passwd:         files/passwd:         files winbind/g' /etc/nsswitch.conf && \
+    sed -i 's/group:          files/group:          files winbind/g' /etc/nsswitch.conf
+
+# -----------------------------------------------------------------------------
+# Create the "entrypoint.sh" Script
+# -----------------------------------------------------------------------------
+# Hard coding the "entrypoint.sh" script into Dockerfile allows for mobility
+#   *  Only one file (this Dockerfile) is required to spin up new AD/DC's
+#   *  A "provisioning.env" file may be supplied, but it is optional
+#   *  Docker Secrets may also be configured, but this again is optional
+RUN cat <<'EOF' > /entrypoint.sh
+#!/bin/bash
+
+set -e
+
+########################################
+# 1. SET GLOBAL VARIABLES
+########################################
+
+# ENV_FILE
+ENV_FILE="/tmp/provision.env"
+
+# This is the list of ENV variables used in this script.  The use case in
+# doing it this way is to be human readalbe and easily modifiable.
+AD_VAR_LIST=(
+  "AD_ADMIN_PASS"
+  "AD_FQDN"
+  "DNS_FORWARDER"
+  "AD_CREATE_USERS"
+)
+
+########################################
+# 2. FUNCTIONS
+########################################
+
+load_env_from_file() {
+  #----------------------------------------
+  # Load ENV vars - From .env file
+  #----------------------------------------
+  # If an ${ENV_FILE} file exists, load the variables.
+  #   If an ENV variable exists and is also defined in the ${ENV_FILE}, the ENV
+  #   variable will be overwritten with what's in the ${ENV_FILE}.
+  local key=""
+  local VALUE=""
+
+  if [ -f "$ENV_FILE" ]; then
+    echo "[INIT] Sourcing ENV vars from file: [${ENV_FILE}]"
+    echo "[INIT] NOTE: ENV vars declared in this file will overwrite previously"
+    echo "             defined ENV vars."
+    for key in "${AD_VAR_LIST[@]}"; do
+      if grep -q "^${key}=" "${ENV_FILE}"; then
+        echo "[INIT] Sourcing var: [${key}]"
+        # Extract the value, preserving spaces
+        VALUE=$(grep "^${key}=" "${ENV_FILE}" | head -n1 | cut -d'=' -f2-)
+        # Export the variable with its exact value
+        export "${key}=${VALUE}"
+      fi
+    done
+  fi
+}
+
+load_env_from_secret() {
+  #----------------------------------------
+  # Load ENV vars - From Docker Secret
+  #----------------------------------------
+  # If an ENV variable or a variable defined in the ${ENV_FILE} exists, it
+  # will be overwritten with what's in the Docker Secret.
+
+  local key=""
+  local VALUE=""
+  local secret_file
+
+  # Check if:
+  #   *  The '/run/secrets' directory exists
+  #   *  Any Docker Secrets defined in the directory
+  if [ -d /run/secrets ] && [ "$(ls -A /run/secrets)" ]; then
+    echo "[INIT] Sourcing Docker Secrets."
+    echo "[INIT] NOTE: ENV vars declared as a Docker Secret will overwrite previously"
+    echo "             defined ENV vars."
+
+    # Parse the Docker Secret (ignoring case)
+    for key in "${AD_VAR_LIST[@]}"; do
+      secret_file=$(find /run/secrets -maxdepth 1 -type f -iname "$key" 2>/dev/null | head -n 1)
+
+      if [ -n "$secret_file" ]; then
+        echo "[INIT] Sourcing Docker Secret: [${key}]"
+        # Extract the value, preserving spaces
+        VALUE="$(cat "${secret_file}")"
+        # Export the variable with its exact value
+        export "${key}=${VALUE}"
+      else
+        echo "[INIT] No Docker Secret provided for: [${key}]"
+      fi
+    done
+  fi
+}
+
+verify_vars() {
+  local missing=0
+
+  echo "[INIT] Validating ENV variables"
+
+  for key in "${AD_VAR_LIST[@]}"; do
+    # "${!key}" is indirect expansion: it gets the value of the variable
+    # whose name is stored in the string 'key'
+    if [[ -z "${!key}" ]]; then
+      if [ "${key}" == "AD_ADMIN_PASS" ] || [ "${key}" == "AD_FQDN" ] || [ "${key}" == "DNS_FORWARDER" ]; then
+        echo "[ERROR] Required ENV variable not provided: ${key}"
+        missing=$((missing + 1))
+      else
+        echo "[WARN] Optional ENV variable not provided: ${key}"
+      fi
+    fi
+  done
+
+  if [[ $missing -eq 0 ]]; then
+    echo "[INIT] ENV variables validated: all vars present"
+  else
+    echo "[ERROR] ENV variables not provided, exiting..."
+    exit 1
+  fi
+}
+
+create_realm_from_fqdn() {
+  #----------------------------------------
+  # Create ENV vars - REALM - from FQDN
+  #----------------------------------------
+  # Use AD_FQDN to assign value AD_REALM
+  #   *  Force FQDN to uppercase
+  AD_REALM="${AD_FQDN^^}"
+}
+
+create_netbios_from_fqdn() {
+  #----------------------------------------
+  # Create ENV vars - NetBIOS - from FQDN
+  #----------------------------------------
+  # Use AD_FQDN to assign value AD_NETBIOS
+  #   *  Take everything before the first dot in FQDN
+  #   *  Force to uppercase
+  AD_NETBIOS="${AD_FQDN%%.*}"
+  AD_NETBIOS="${AD_NETBIOS^^}"
+}
+
+prep_samba() {
+  #----------------------------------------
+  # Prepare Samba
+  #----------------------------------------
+  # Delete stale Samba process ID, if it exists
+  rm -f /run/samba/*.pid /var/run/samba/*.pid
+}
+
+provision_samba() {
+  #----------------------------------------
+  # Provision Samba AD/DC
+  #----------------------------------------
+  echo "[INIT] Provisioning new domain: ${AD_REALM}"
+
+  # NOTE: Default AD Functional Level is 2008_R2
+  samba-tool domain provision \
+    --server-role=dc \
+    --use-rfc2307 \
+    --dns-backend=SAMBA_INTERNAL \
+    --realm="${AD_REALM}" \
+    --domain="${AD_NETBIOS}" \
+    --adminpass="${AD_ADMIN_PASS}" \
+    --function-level=2008_R2 \
+    --option="dns forwarder = ${DNS_FORWARDER}"
+}
+
+upgrade_samba() {
+  #----------------------------------------
+  # Upgrade AD/DC Functional Level
+  #----------------------------------------
+  # Upgrade Samba Conf to functional level 2019
+  # NOTE: Microsoft made no changes to the schema
+  #       between functional levels 2016 & 2019.
+  #       Therefore, these are both the same.
+  echo "[INIT] Updating 'smb.conf' for functional level 2019"
+  sed -i '/\[global\]/a\\tad dc functional level = 2016' /etc/samba/smb.conf
+  # Upgrading AD/DC schema to 2016/2019
+  echo "[INIT] Upgrading schema to 2019"
+  samba-tool domain schemaupgrade --schema=2019
+  # Prepping AD/DC for functional level to 2016/2019
+  echo "[INIT] Upgrading to functional level 2016/2019"
+  samba-tool domain functionalprep --function-level=2016
+  # Upgrading AD/DC to functional level 2016/2019
+  echo "[INIT] Raising AD/DC functional level to: 2016/2019"
+  samba-tool domain level raise \
+    --domain-level=2016 \
+    --forest-level=2016
+  # Verifing AD/DC functional level after upgrade
+  echo "[INIT] Checking current AD/DC domain level"
+  samba-tool domain level show
+  # Verifing AD/DC database after functional level upgrade
+  echo "[INIT] Verifying AD/DC database"
+  samba-tool dbcheck --cross-ncs --fix --yes
+}
+
+create_ad_users() {
+  #----------------------------------------
+  # User Creation
+  #----------------------------------------
+  if [ -z "$AD_CREATE_USERS" ]; then
+    echo "[INIT] No users provided.  No users created."
+  else
+    echo "[INIT] Provisioning user accounts..."
+    # Loop through a comma-separated list: "user1:pass123,user2:pass456"
+    IFS=',' read -ra AD_USERS <<< "$AD_CREATE_USERS"
+    for USER_DATA in "${AD_USERS[@]}"; do
+      # Split the data into 3 parts: User, Pass, Groups
+      IFS=':' read -r USER_NAME USER_PASS USER_GROUPS <<< "$USER_DATA"
+
+      echo "[INIT] Creating user: ${USER_NAME}"
+      samba-tool user create "${USER_NAME}" "${USER_PASS}" --use-username-as-cn
+
+      # If groups are specified, loop through and add the user
+      if [ -n "$USER_GROUPS" ]; then
+        # Support multiple groups separated by semi-colon: group1;group2
+        IFS=';' read -ra GROUP_LIST <<< "$USER_GROUPS"
+        for GROUPNAME in "${GROUP_LIST[@]}"; do
+          if [ "$GROUPNAME" != "Domain Users" ]; then
+            echo "[INIT] Adding ${USER_NAME} to group: ${GROUPNAME}"
+            samba-tool group addmembers "${GROUPNAME}" "${USER_NAME}"
+          fi
+        done
+      fi
+    done
+  fi
+}
+
+create_dns_reverse_lookup_zone() {
+  #----------------------------------------
+  # DNS Reverse Lookup Zone Creation
+  #----------------------------------------
+  echo "[INIT] Creating reverse DNS lookup zone."
+
+  echo "[INIT] Detecting network for Reverse DNS..."
+  # Get IP and CIDR (e.g., 198.162.1.11/24)
+  ADDR_CIDR=$(ip -o -f inet addr show eth0 | awk '{print $4}')
+  IP_ADDR="${ADDR_CIDR%/*}"
+  MASK_BITS="${ADDR_CIDR#*/}"
+
+  # Calculate the Reverse Zone name based on mask
+  # This logic handles /24 (3 octets) and /16 (2 octets)
+  IFS=. read -r i1 i2 i3 i4 <<< "$IP_ADDR"
+  if [ "$MASK_BITS" -le 16 ]; then
+      REVERSE_ZONE="${i2}.${i1}.in-addr.arpa"
+  elif [ "$MASK_BITS" -le 24 ]; then
+      REVERSE_ZONE="${i3}.${i2}.${i1}.in-addr.arpa"
+  else
+      # Fallback for smaller subnets, usually handled as /24 in DNS
+      REVERSE_ZONE="${i3}.${i2}.${i1}.in-addr.arpa"
+  fi
+
+  ### Start Samba temporarily to configure DNS ###
+  echo "[INIT] Starting temporary Samba instance to configure DNS"
+  /usr/sbin/samba -M single -i &
+  SAMBA_PID=$!
+  # Allow Samba time to start
+  sleep 5
+
+  # Print all DNS zones before modification
+  echo "[INIT] Printing DNS zonelist of localhost - pre-modification"
+  samba-tool dns zonelist 127.0.0.1 -UAdministrator --password=${AD_ADMIN_PASS}
+
+  # Create reverse lookup zone
+  echo "[INIT] Creating Reverse Zone: ${REVERSE_ZONE}"
+  samba-tool dns zonecreate 127.0.0.1 ${REVERSE_ZONE} -UAdministrator --password=${AD_ADMIN_PASS}
+  # Add the PTR record for the DC itself
+  # Logic: The last octet for a /24, or last two for a /16
+  if [ "$MASK_BITS" -le 16 ]; then
+      PTR_ID="${i4}.${i3}"
+  else
+      PTR_ID="${i4}"
+  fi
+  echo "[INIT] Adding PTR record: ${PTR_ID} -> ${AD_FQDN}"
+  samba-tool dns add 127.0.0.1 ${REVERSE_ZONE} ${PTR_ID} PTR ${AD_FQDN} -UAdministrator --password=${AD_ADMIN_PASS}
+
+  # Print all DNS zones after moficiation
+  echo "[INIT] Printing DNS zonelist of localhost - post modification"
+  samba-tool dns zonelist 127.0.0.1 -UAdministrator --password=${AD_ADMIN_PASS}
+
+  ### Stop temporary Samba
+  echo "[INIT] Killing temporary Samba instance"
+  kill $SAMBA_PID
+}
+
+prep_os() {
+  #----------------------------------------
+  # Configure OS for AD/DC
+  #----------------------------------------
+  # Copy krb5.conf
+  echo "[INIT] Copying 'krb5.conf' to standard path"
+  cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+
+  # [OPTIONAL] Force Winbind to use the correct domain SID lookup logic
+  echo "[INIT] Updating Winbindd"
+  sed -i '/\[global\]/a\\twinbind nested groups = yes' /etc/samba/smb.conf
+  sed -i '/\[global\]/a\\twinbind scan trusted domains = no' /etc/samba/smb.conf
+
+  # Map the container's internal IP to:
+  #   *  The AD FQDN
+  #   *  The NetBIOS name
+  #   *  The container's hostname
+  # NOTE: This is to reduce DNS lookup timeouts for all services running (nsswitch, winbindd, etc.)
+  echo "$(hostname -I | awk '{print $1}') ${AD_FQDN} ${AD_NETBIOS} $(hostname)" >> /etc/hosts
+
+  # Force the container to use itself (not Docker) for DNS - ensures AD SRV records resolve locally
+  echo "nameserver 127.0.0.1" > /etc/resolv.conf
+}
+
+reset_ntfs_perms() {
+  #----------------------------------------
+  # Reset NTFS permissions on SysVol
+  #----------------------------------------
+  # NOTE: This is MUCH more important that it appears.  It's one line.  But this
+  #       one line is the single reason why 'samba-ad-dc' can't be baked entirely
+  #       a Docker image, and instead requires this 'entrypoint.sh' script.
+  samba-tool ntacl sysvolreset
+}
+
+cleanup() {
+  #----------------------------------------
+  # Cleanup
+  #----------------------------------------
+  echo "[CLEANUP] Purging credentials and sensitive info..."
+  # Wipe local and global variables from memory - AD vars
+  unset AD_ADMIN_PASS AD_FQDN DNS_FORWARDER AD_CREATE_USERS AD_USERS USER_NAME USER_PASS USER_GROUPS GROUP_LIST GROUPNAME ADDR_CIDR VALUE
+  # Wipe local and global variables from memory - User vars
+  unset AD_CREATE_USERS AD_USERS USER_NAME USER_PASS USER_GROUPS GROUP_LIST GROUPNAME
+  # Wipe local and global variables from memory - DNS vars
+  unset ADDR_CIDR IP_ADDR MASK_BITS i1 i2 i3 i4 REVERSE_ZONE PTR_ID
+  # Wipe local and global variables from memory - Samba PID
+  unset SAMBA_PID
+}
+
+########################################
+# 3. AD/DC PROVISIONING
+########################################
+if [ ! -f /etc/samba/smb.conf ]; then
+
+  # The vars below are entirely for documentation purposes, and therefore
+  # completely commented.  Any ENV variables that were defined at
+  # 'docker run ...' time or defined in a docker compose file will be
+  # available at this time, as shown below.
+
+  # AD_ADMIN_PASS=${AD_ADMIN_PASS}
+  # AD_FQDN=${AD_FQDN}
+  # DNS_FORWARDER=${DNS_FORWARDER}
+  # AD_CREATE_USERS=${AD_CREATE_USERS}
+
+  # Overwrite ENV vars above, if ${ENV_FILE} exists
+  load_env_from_file
+
+  # Overwrite ENV vars above, if Docker Secrets exist
+  load_env_from_secret
+
+  # Verify the ENV vars provided
+  verify_vars
+
+  # Create REALM and NETBIOS from FQDN
+  create_realm_from_fqdn
+  create_netbios_from_fqdn
+
+  # Provision Samba AD/DC
+  prep_samba
+  provision_samba
+  upgrade_samba
+  create_ad_users
+  create_dns_reverse_lookup_zone
+  prep_os
+  reset_ntfs_perms
+
+  # Cleanup
+  cleanup
+
+  echo "[INIT] AD/DC Provisioning complete."
+
+fi
+
+########################################
+# 4. START THE AD/DC
+########################################
+echo "[START] Starting Samba AD/DC..."
+exec "$@"
+EOF
+
+RUN chmod +x /entrypoint.sh
+
+# -----------------------------------------------------------------------------
+# Expose standard AD/DC ports
+# -----------------------------------------------------------------------------
+
+# WINS (if needed)
+EXPOSE 42/tcp 42/udp
+
+# DNS
+EXPOSE 53/tcp 53/udp
+
+# Kerberos - General Communication
+EXPOSE 88/tcp 88/udp
+
+# Kerberos - Password Change
+EXPOSE 464/tcp 464/udp
+
+# RPC Endpoint Mapper
+EXPOSE 135/tcp
+
+# NetBIOS
+EXPOSE 137/udp 138/udp 139/tcp
+
+# Server Message Block (SMB)
+EXPOSE 445/tcp
+
+# LDAP & LDAPS
+EXPOSE 389/tcp 389/udp 636/tcp
+
+# Global Catalog
+EXPOSE 3268/tcp 3269/tcp
+
+# Dynamic RPC Ports (Required for RSAT/DRS Replication)
+# Note: In a production smb.conf, you should restrict these
+# using 'rpc server port = 49152'
+EXPOSE 49152-65535/tcp
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
