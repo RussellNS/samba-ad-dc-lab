@@ -26,11 +26,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     samba-vfs-modules \
     python3-samba \
     python3-setproctitle \
+    python3-cryptography \
     \
     # --- Identity & Authentication ---
     # Kerberos for secure tickets and Winbind for Linux/AD identity mapping
     krb5-user \
     krb5-config \
+    libkrb5-dev \
     libpam-krb5 \
     winbind \
     libnss-winbind \
@@ -41,6 +43,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ldb-tools \
     tdb-tools \
     ldap-utils \
+    \
+    # --- Samba AWDS Dependencies ---
+    # Required for the Catalyst Samba ADWS Proxy
+    python3-lxml \
+    python3-cryptography \
+    libldap2-dev \
+    libsasl2-dev \
     \
     # --- Filesystem Permissions ---
     # Required for Windows ACL support and extended filesystem attributes
@@ -56,9 +65,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     \
     # --- System Management & Lifecycle ---
-    # Supervisor for process management and Tini for correct signal handling
+    # Supervisor for process management, Tini for correct signal handling
     tini \
     supervisor \
+    \
+    # --- Git & App Provisioning ---
+    # Git, pip, and gcc for application installs
+    git \
+    python3-pip \
+    python3-setuptools \
+    python3-wheel \
+    python3-dev \
+    python3-gssapi \
+    python3-pygments \
+    gcc \
     \
     # --- Administrative Utilities ---
     # General purpose tools for file sync, testing shares, and text editing
@@ -67,6 +87,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     tzdata-legacy \
     nano \
+    curl \
+    wget \
     # Start AD/DC fresh, but keep original 'smb.conf' (enable first time install)
     && mv /etc/samba/smb.conf /etc/samba/smb.conf.orig \
     # Clean up apt
@@ -78,7 +100,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # -----------------------------------------------------------------------------
 # Configure supervisord
 # -----------------------------------------------------------------------------
-# Create Supervisor configuration to manage the Samba process
+# Create Supervisor configuration to manage the Samba AD/DC process
 # (This replaces the init script's job of starting services)
 RUN echo "[supervisord]" > /etc/supervisor/conf.d/supervisord.conf && \
     echo "nodaemon=true" >> /etc/supervisor/conf.d/supervisord.conf && \
@@ -86,6 +108,27 @@ RUN echo "[supervisord]" > /etc/supervisor/conf.d/supervisord.conf && \
     echo "[program:samba]" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "command=/usr/sbin/samba -i" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "autorestart=true" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stdout_logfile=/dev/stdout" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stdout_logfile_maxbytes=0" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stderr_logfile=/dev/stderr" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "stderr_logfile_maxbytes=0" >> /etc/supervisor/conf.d/supervisord.conf
+
+# -----------------------------------------------------------------------------
+# Update supervisord
+# -----------------------------------------------------------------------------
+# Update the Supervisor configuration to manage the Catalyst Samba ADWS Proxy
+# NOTE: Samba AD/DC does NOT include Active Directory Web Services (ADWS).  For
+#       this reason, PowerShell scripting with the cmdlets that manipulate AD
+#       objects (AD-GetComputer, etc.) do not work.
+#       If your goal is to script against a disposable AD/DC in a lab
+#       environment, then you may need this depending on the specific cmdlets
+#       you're testing.
+RUN echo "[program:adws]" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "command=/usr/bin/python3 /opt/samba-adws/main.py -b 0.0.0.0 -p 9389" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "autostart=true" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "startsecs=5" >> /etc/supervisor/conf.d/supervisord.conf && \
+    echo "environment=PYTHONPATH=\"/usr/lib/python3/dist-packages\"" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "stdout_logfile=/dev/stdout" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "stdout_logfile_maxbytes=0" >> /etc/supervisor/conf.d/supervisord.conf && \
     echo "stderr_logfile=/dev/stderr" >> /etc/supervisor/conf.d/supervisord.conf && \
@@ -103,6 +146,22 @@ RUN mkdir -p /run/samba /var/lib/samba/private /var/lib/samba/bind-dns
 # Configure OS to look at winbind for user/group lookups
 RUN sed -i 's/passwd:         files/passwd:         files winbind/g' /etc/nsswitch.conf && \
     sed -i 's/group:          files/group:          files winbind/g' /etc/nsswitch.conf
+
+# -----------------------------------------------------------------------------
+# Configure Active Directory Web Services (ADWS)
+# -----------------------------------------------------------------------------
+# Clone the RussellNS Samba ADWS Project
+RUN echo "16"
+#RUN pip3 install --break-system-packages "setuptools<74.0.0"
+WORKDIR /opt
+# Clone the Release v1.0.0 version of Samba ADWS
+#RUN git clone https://github.com/RussellNS/samba-adws.git --branch v1.0.0
+RUN git clone https://github.com/RussellNS/samba-adws.git --branch master
+# Change into the cloned directory
+WORKDIR /opt/samba-adws
+
+RUN pip3 install --break-system-packages -r requirements.txt
+RUN pip3 install --break-system-packages .
 
 # -----------------------------------------------------------------------------
 # Create the "entrypoint.sh" Script
@@ -230,7 +289,7 @@ create_realm_from_fqdn() {
   #----------------------------------------
   # Use AD_FQDN to assign value AD_REALM
   #   *  Force FQDN to uppercase
-  AD_REALM="${AD_FQDN^^}"
+  export AD_REALM="${AD_FQDN^^}"
 }
 
 create_netbios_from_fqdn() {
@@ -240,8 +299,46 @@ create_netbios_from_fqdn() {
   # Use AD_FQDN to assign value AD_NETBIOS
   #   *  Take everything before the first dot in FQDN
   #   *  Force to uppercase
-  AD_NETBIOS="${AD_FQDN%%.*}"
-  AD_NETBIOS="${AD_NETBIOS^^}"
+  export AD_NETBIOS="${AD_FQDN%%.*}"
+  export AD_NETBIOS="${AD_NETBIOS^^}"
+}
+
+prep_os() {
+  #----------------------------------------
+  # Configure OS for AD/DC
+  #----------------------------------------
+  # Store the IP in a local variable
+  LOCAL_IP=$(hostname -I | awk '{print $1}')
+  # Store the hostname in a local variable
+  LOCAL_HOSTNAME=$(hostname)
+
+  # Check if variables are empty and log a warning if they are
+  if [ -z "$AD_FQDN" ] || [ -z "$AD_NETBIOS" ]; then
+      echo "[WARN] AD_FQDN ($AD_FQDN) or AD_NETBIOS ($AD_NETBIOS) is empty in prep_os!"
+  else
+      echo "[INIT] AD_FQDN ($AD_FQDN) or AD_NETBIOS ($AD_NETBIOS) are NOT empty in prep_os!"
+  fi
+
+  # Create a NEW temporary '/etc/hosts' file
+  echo "127.0.0.1 localhost" > /etc/hosts.new
+  echo "::1 localhost ip6-localhost ip6-loopback" >> /etc/hosts.new
+
+  # Map the container's internal IP to:
+  #   *  The AD FQDN
+  #   *  The NetBIOS name
+  #   *  The container's hostname
+  # NOTE: This is to reduce DNS lookup timeouts for all services running (nsswitch, winbindd, etc.)
+  #echo "$(hostname -I | awk '{print $1}') ${AD_FQDN} ${AD_NETBIOS} $(hostname)" >> /etc/hosts
+  echo "${LOCAL_IP} ${AD_FQDN} ${AD_NETBIOS} ${LOCAL_HOSTNAME}" >> /etc/hosts.new
+
+  # Force-move the new file over the old one
+  cp -f /etc/hosts.new /etc/hosts
+  rm /etc/hosts.new
+
+  # Force the container to use itself (not Docker) for DNS - ensures AD SRV records resolve locally
+  echo "nameserver 127.0.0.1" > /etc/resolv.conf
+  echo "search ${AD_FQDN,,}" >> /etc/resolv.conf
+  echo "options ndots:1" >> /etc/resolv.conf
 }
 
 prep_samba() {
@@ -268,6 +365,11 @@ provision_samba() {
     --adminpass="${AD_ADMIN_PASS}" \
     --function-level=2008_R2 \
     --option="dns forwarder = ${DNS_FORWARDER}"
+
+  # [OPTIONAL] Force Winbind to use the correct domain SID lookup logic
+  echo "[INIT] Updating Winbindd"
+  sed -i '/\[global\]/a\\twinbind nested groups = yes' /etc/samba/smb.conf
+  sed -i '/\[global\]/a\\twinbind scan trusted domains = no' /etc/samba/smb.conf
 }
 
 upgrade_samba() {
@@ -297,6 +399,32 @@ upgrade_samba() {
   # Verifing AD/DC database after functional level upgrade
   echo "[INIT] Verifying AD/DC database"
   samba-tool dbcheck --cross-ncs --fix --yes
+}
+
+prep_kerberos() {
+  echo "[INIT] Creating optimized /etc/krb5.conf"
+  cat <<END > /etc/krb5.conf
+[libdefaults]
+    default_realm = ${AD_REALM}
+    dns_lookup_realm = false
+    dns_lookup_kdc = true
+    # Added to prevent issues with mismatched reverse DNS
+    rdns = false
+
+[realms]
+    ${AD_REALM} = {
+        # Use FQDN as primary KDC
+        #kdc = ${AD_FQDN}
+        kdc = 127.0.0.1
+        #admin_server = ${AD_FQDN}
+        admin_server = 127.0.0.1
+        default_domain = ${AD_FQDN,,}
+    }
+
+[domain_realm]
+    .${AD_FQDN,,} = ${AD_REALM}
+    ${AD_FQDN,,} = ${AD_REALM}
+END
 }
 
 create_ad_users() {
@@ -331,6 +459,20 @@ create_ad_users() {
   fi
 }
 
+start_temp_samba() {
+  #----------------------------------------
+  # Start a temporary Samba instance
+  #----------------------------------------
+  echo "[INIT] Starting temporary Samba instance for configuration..."
+  # Start Samba in background. -M single -i is good for interactive/setup logs.
+  /usr/sbin/samba -M single -i &
+  SAMBA_PID=$!
+
+  # Wait for the KDC and LDAP ports to be ready
+  echo "[INIT] Waiting for Samba to initialize (PID: $SAMBA_PID)..."
+  sleep 5
+}
+
 create_dns_reverse_lookup_zone() {
   #----------------------------------------
   # DNS Reverse Lookup Zone Creation
@@ -346,7 +488,9 @@ create_dns_reverse_lookup_zone() {
   # Calculate the Reverse Zone name based on mask
   # This logic handles /24 (3 octets) and /16 (2 octets)
   IFS=. read -r i1 i2 i3 i4 <<< "$IP_ADDR"
-  if [ "$MASK_BITS" -le 16 ]; then
+  if [ "$MASK_BITS" -le 8 ]; then
+      REVERSE_ZONE="${i1}.in-addr.arpa"
+  elif [ "$MASK_BITS" -le 16 ]; then
       REVERSE_ZONE="${i2}.${i1}.in-addr.arpa"
   elif [ "$MASK_BITS" -le 24 ]; then
       REVERSE_ZONE="${i3}.${i2}.${i1}.in-addr.arpa"
@@ -355,23 +499,38 @@ create_dns_reverse_lookup_zone() {
       REVERSE_ZONE="${i3}.${i2}.${i1}.in-addr.arpa"
   fi
 
-  ### Start Samba temporarily to configure DNS ###
-  echo "[INIT] Starting temporary Samba instance to configure DNS"
-  /usr/sbin/samba -M single -i &
-  SAMBA_PID=$!
-  # Allow Samba time to start
-  sleep 5
+  # Define the standard RFC 6303 zones
+  #   *  0.in-addr.arpa
+  #      Corresponds to the 0.0.0.0 network (often used as a "null" or default address).
+  #      Immediately tell a client "I don't have a specific name for 0.0.0.0"
+  #      (Authoritative NXDOMAIN) rather than waiting for a timeout from an external server.
+  #   *  127.in-addr.arpa
+  #      Corresponds to the 127.0.0.0/8 range (the Loopback/localhost address).
+  #      Immediately tell a client "I don't have a specific name for 127.0.0.0", which
+  #      prevents "leakage" if an app tries to do a reverse DNS lookup on 127.0.0.1, rather
+  #      than forward the request upstream.
+  #   *  255.in-addr.arpa
+  #      Corresponds to the 255.255.255.255 address (the limited broadcast address).
+  RFC_ZONES=("0.in-addr.arpa" "127.in-addr.arpa" "255.in-addr.arpa")
 
   # Print all DNS zones before modification
   echo "[INIT] Printing DNS zonelist of localhost - pre-modification"
   samba-tool dns zonelist 127.0.0.1 -UAdministrator --password=${AD_ADMIN_PASS}
 
+  # Create the standard RFC zones
+  for ZONE in "${RFC_ZONES[@]}"; do
+      echo "[INIT] Creating RFC 6303 zone: ${ZONE}"
+      samba-tool dns zonecreate 127.0.0.1 "${ZONE}" -UAdministrator --password="${AD_ADMIN_PASS}"
+  done
+
   # Create reverse lookup zone
-  echo "[INIT] Creating Reverse Zone: ${REVERSE_ZONE}"
+  echo "[INIT] Creating Primary Reverse Zone: ${REVERSE_ZONE}"
   samba-tool dns zonecreate 127.0.0.1 ${REVERSE_ZONE} -UAdministrator --password=${AD_ADMIN_PASS}
   # Add the PTR record for the DC itself
   # Logic: The last octet for a /24, or last two for a /16
-  if [ "$MASK_BITS" -le 16 ]; then
+  if [ "$MASK_BITS" -le 8 ]; then
+      PTR_ID="${i4}.${i3}.${i2}"
+  elif [ "$MASK_BITS" -le 16 ]; then
       PTR_ID="${i4}.${i3}"
   else
       PTR_ID="${i4}"
@@ -382,34 +541,36 @@ create_dns_reverse_lookup_zone() {
   # Print all DNS zones after moficiation
   echo "[INIT] Printing DNS zonelist of localhost - post modification"
   samba-tool dns zonelist 127.0.0.1 -UAdministrator --password=${AD_ADMIN_PASS}
-
-  ### Stop temporary Samba
-  echo "[INIT] Killing temporary Samba instance"
-  kill $SAMBA_PID
 }
 
-prep_os() {
+prep_adws() {
   #----------------------------------------
-  # Configure OS for AD/DC
+  # Prepare ADWS Proxy Environment
   #----------------------------------------
-  # Copy krb5.conf
-  echo "[INIT] Copying 'krb5.conf' to standard path"
-  cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+  # The ADWS proxy often needs a valid Kerberos ticket or keytab
+  # to speak to the LDAP backend.
+  echo "[INIT] Initializing Kerberos ticket for ADWS service..."
 
-  # [OPTIONAL] Force Winbind to use the correct domain SID lookup logic
-  echo "[INIT] Updating Winbindd"
-  sed -i '/\[global\]/a\\twinbind nested groups = yes' /etc/samba/smb.conf
-  sed -i '/\[global\]/a\\twinbind scan trusted domains = no' /etc/samba/smb.conf
+  # We use the Administrator password to get a ticket initially
+  # so the proxy can bind to LDAP on 127.0.0.1
+  echo "${AD_ADMIN_PASS}" | kinit Administrator@${AD_REALM}
 
-  # Map the container's internal IP to:
-  #   *  The AD FQDN
-  #   *  The NetBIOS name
-  #   *  The container's hostname
-  # NOTE: This is to reduce DNS lookup timeouts for all services running (nsswitch, winbindd, etc.)
-  echo "$(hostname -I | awk '{print $1}') ${AD_FQDN} ${AD_NETBIOS} $(hostname)" >> /etc/hosts
+  # Note: In a production-hardened container, you'd export a keytab here:
+  # samba-tool domain exportkeytab /etc/adws.keytab --principal=ADWS/$(hostname)
+}
 
-  # Force the container to use itself (not Docker) for DNS - ensures AD SRV records resolve locally
-  echo "nameserver 127.0.0.1" > /etc/resolv.conf
+stop_temp_samba() {
+  #----------------------------------------
+  # Stop the temporary Samba instance
+  #----------------------------------------
+  if [ -n "$SAMBA_PID" ]; then
+    echo "[INIT] Stopping temporary Samba instance (PID: $SAMBA_PID)..."
+    kill "$SAMBA_PID"
+    wait "$SAMBA_PID" 2>/dev/null
+    echo "[INIT] Samba stopped."
+  else
+    echo "[WARN] No Samba PID found to stop."
+  fi
 }
 
 reset_ntfs_perms() {
@@ -465,13 +626,28 @@ if [ ! -f /etc/samba/smb.conf ]; then
   create_realm_from_fqdn
   create_netbios_from_fqdn
 
+  # Update OS files for Samba
+  prep_os
+
   # Provision Samba AD/DC
   prep_samba
   provision_samba
   upgrade_samba
+  prep_kerberos
+
+  # Create Users in AD
   create_ad_users
+
+  # Start a temp Samba service, then:
+  #   *  Create reverse lookup zones per RFC 6303
+  #   *  Prep Active Directory Web Services (ADWS)
+  # Then stop the temp Samba
+  start_temp_samba
   create_dns_reverse_lookup_zone
-  prep_os
+  prep_adws
+  stop_temp_samba
+
+  # Set Windows 'sysvol' permissions in Linux container
   reset_ntfs_perms
 
   # Cleanup
@@ -525,6 +701,22 @@ EXPOSE 3268/tcp 3269/tcp
 # Note: In a production smb.conf, you should restrict these
 # using 'rpc server port = 49152'
 EXPOSE 49152-65535/tcp
+
+# DEBUG - The 'RUN' line below causes the Docker build process to pause
+# DEBUG - indefinitely.  This can be used to pause a docker build, enter the
+# DEBUG - container in the middle of the build, then expand on Docker build
+# DEBUG - logic or identify and troubleshoot Docker build problems.  Perform
+# DEBUG - these steps to use:
+# DEBUG -   1) Build the Docker image using one of these commands:
+# DEBUG -        *  DOCKER_BUILDKIT=0 docker build -f <Dockerfile> .
+# DEBUG -        *  DOCKER_BUILDKIT=0 docker compose up
+# DEBUG -   2) When the build pauses, press CRTL+z (not CTRL+c).
+# DEBUG -   3) Enter 'docker container ls' to view container name.
+# DEBUG -   4) Use 'docker exec -it <container_name> sh' (or 'bash') to enter
+# DEBUG -      unfinished build.
+# DEBUG -   5) Manually run your commands inside the container.
+# DEBUG - Comment or delete when not needed.
+#RUN echo "##### DEBUG - Docker build pause #####" && echo "Use the following commands:" && echo "    CTRL+z" && echo "    docker container ls # get container name" && echo "    docker exec -it <container_name> [sh|bash]" && echo "    Run your commands during Docker build" && tail -f /dev/null
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
